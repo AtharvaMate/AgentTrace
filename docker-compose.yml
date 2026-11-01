@@ -1,0 +1,78 @@
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: agenttrace_floci
+    ports:
+      - "4566:4566"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - floci_data:/app/data
+    environment:
+      FLOCI_STORAGE_MODE: hybrid
+      FLOCI_SERVICES_UI_ENABLED: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/4566"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  db:
+    image: postgres:16-alpine
+    container_name: agenttrace_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agenttrace}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agenttrace_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-agenttrace}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agenttrace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    container_name: agenttrace_backend
+    environment:
+      DATABASE_URL: postgresql://agenttrace:agenttrace_secret@db:5432/agenttrace
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      SEED_ON_STARTUP: "true"
+      AWS_ENDPOINT_URL: http://floci:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      CLOUDTRAIL_BUCKET: agenttrace-cloudtrail-logs
+      CLOUDTRAIL_POLL_INTERVAL: "60"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      floci:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ml_models:/app/ml_models
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build: ./frontend
+    container_name: agenttrace_frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8000
+
+volumes:
+  postgres_data:
+  floci_data:
+  ml_models:

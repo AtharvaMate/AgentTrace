@@ -1,0 +1,232 @@
+import os
+import json
+import datetime
+import random
+import boto3
+from database import SessionLocal, engine, Base
+from models import Agent, ActivityLog, RiskEvent, BehavioralFingerprint
+
+DEMO_AGENTS = [
+    {
+        "id": "agent-001",
+        "name": "E-Commerce Recommendation Engine",
+        "purpose": (
+            "AI-powered product recommendation system that analyzes customer browsing patterns, "
+            "purchase history, and real-time cart data to generate personalized product suggestions. "
+            "Processes 50K+ daily sessions using Amazon Bedrock for ML inference, reads customer "
+            "profiles from DynamoDB, and writes recommendations to the product-suggestions queue. "
+            "Operates 24/7 with peak traffic 12:00-22:00 UTC."
+        ),
+        "iam_role": "arn:aws:iam::123456789012:role/EcomRecommendationRole",
+        "expected_services": ["dynamodb", "bedrock", "sqs", "s3"],
+        "expected_actions": ["GetItem", "Query", "InvokeModel", "SendMessage", "GetObject"],
+        "iam_permissions": [
+            "dynamodb:GetItem", "dynamodb:Query",
+            "bedrock:InvokeModel",
+            "sqs:SendMessage",
+            "s3:GetObject"
+        ],
+        "owner": "product-team",
+        "environment": "production",
+        "status": "active",
+        "risk_preset": "healthy",
+    },
+    {
+        "id": "agent-002",
+        "name": "Financial Fraud Detection Agent",
+        "purpose": (
+            "Real-time fraud detection system that monitors payment transactions, analyzes spending "
+            "patterns against historical baselines, and flags suspicious activity for manual review. "
+            "Uses Amazon Bedrock's Claude Sonnet for natural language analysis of transaction notes. "
+            "Processes 10K+ transactions daily, writes alerts to the fraud-alerts SNS topic, and "
+            "updates risk scores in the TransactionRisk DynamoDB table. Critical system requiring "
+            "99.9% uptime with <500ms latency."
+        ),
+        "iam_role": "arn:aws:iam::123456789012:role/FraudDetectionRole",
+        "expected_services": ["dynamodb", "bedrock", "sns", "lambda"],
+        "expected_actions": ["GetItem", "PutItem", "UpdateItem", "InvokeModel", "Publish", "InvokeFunction"],
+        "iam_permissions": [
+            "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+            "bedrock:InvokeModel",
+            "sns:Publish",
+            "lambda:InvokeFunction"
+        ],
+        "owner": "security-team",
+        "environment": "production",
+        "status": "active",
+        "risk_preset": "healthy",
+    },
+    {
+        "id": "agent-003",
+        "name": "HR Document Processing Assistant",
+        "purpose": (
+            "Automated HR system that extracts data from employee documents (resumes, contracts, "
+            "onboarding forms) using Amazon Textract, validates information using Bedrock AI, and "
+            "stores processed records in the EmployeeRecords DynamoDB table. Handles PII data "
+            "including SSN, salary information, and health records. Designed for HR operations only "
+            "— strictly prohibited from accessing payment systems, production databases, or "
+            "infrastructure controls. Processes 200+ documents weekly during business hours."
+        ),
+        "iam_role": "arn:aws:iam::123456789012:role/HRDocProcessingRole",
+        "expected_services": ["s3", "textract", "bedrock", "dynamodb"],
+        "expected_actions": ["GetObject", "AnalyzeDocument", "InvokeModel", "PutItem", "UpdateItem"],
+        "iam_permissions": [
+            "s3:GetObject", "s3:PutObject",
+            "textract:AnalyzeDocument",
+            "bedrock:InvokeModel",
+            "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem",
+            # OVER-PRIVILEGED PERMISSIONS (will trigger alerts)
+            "iam:CreateRole", "iam:AttachRolePolicy", "iam:ListRoles",
+            "secretsmanager:GetSecretValue",
+            "rds:ExecuteStatement"
+        ],
+        "owner": "human-resources",
+        "environment": "production",
+        "status": "active",
+        "risk_preset": "critical_iam",
+    },
+    {
+        "id": "agent-004",
+        "name": "Data Lake ETL Orchestrator",
+        "purpose": (
+            "Enterprise-scale ETL pipeline that ingests raw event streams from application logs, "
+            "IoT sensors, and third-party APIs into the central data lake. Runs nightly batch jobs "
+            "via AWS Glue to clean, transform, and partition 50TB+ monthly data volumes. Outputs "
+            "analytics-ready Parquet files to the processed-data S3 bucket and updates metadata in "
+            "the AWS Glue Data Catalog. Operates 01:00-06:00 UTC with strict resource isolation — "
+            "must never access customer PII tables, payment data, or production credentials."
+        ),
+        "iam_role": "arn:aws:iam::123456789012:role/DataLakeETLRole",
+        "expected_services": ["s3", "glue", "athena"],
+        "expected_actions": ["GetObject", "PutObject", "ListBucket", "StartJobRun", "GetJobRun", "StartQueryExecution"],
+        "iam_permissions": [
+            "s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject",
+            "glue:StartJobRun", "glue:GetJobRun", "glue:GetJob", "glue:UpdateTable",
+            "athena:StartQueryExecution", "athena:GetQueryResults",
+            # OVER-PRIVILEGED PERMISSIONS (will trigger alerts)
+            "secretsmanager:GetSecretValue", "secretsmanager:ListSecrets",
+            "dynamodb:Scan", "dynamodb:GetItem"
+        ],
+        "owner": "data-engineering",
+        "environment": "production",
+        "status": "active",
+        "risk_preset": "critical_secrets",
+    },
+    {
+        "id": "agent-005",
+        "name": "DevOps Auto-Scaling Manager",
+        "purpose": (
+            "Infrastructure automation agent that monitors CloudWatch metrics and dynamically scales "
+            "application resources in the staging environment. Updates Lambda concurrency limits, "
+            "starts/stops EC2 instances based on load patterns, and deploys infrastructure changes "
+            "via CloudFormation. Processes 500+ scaling events weekly. Restricted to staging-* "
+            "resources only — must never modify production infrastructure, access customer data, "
+            "or handle payment credentials. Operates 24/7 with 5-minute evaluation intervals."
+        ),
+        "iam_role": "arn:aws:iam::123456789012:role/AutoScalingManagerRole",
+        "expected_services": ["lambda", "ec2", "cloudformation", "cloudwatch"],
+        "expected_actions": [
+            "UpdateFunctionConfiguration", "GetFunction", 
+            "StartInstances", "StopInstances", "DescribeInstances",
+            "UpdateStack", "DescribeStacks",
+            "GetMetricData", "PutMetricData"
+        ],
+        "iam_permissions": [
+            "lambda:UpdateFunctionConfiguration", "lambda:GetFunction",
+            "ec2:StartInstances", "ec2:StopInstances", "ec2:DescribeInstances", "ec2:TerminateInstances",
+            "cloudformation:UpdateStack", "cloudformation:DescribeStacks",
+            "cloudwatch:GetMetricData", "cloudwatch:PutMetricData",
+            "s3:GetObject", "s3:PutObject",
+            # OVER-PRIVILEGED PERMISSIONS (will trigger alerts)
+            "dynamodb:Scan", "dynamodb:DeleteItem",
+            "s3:DeleteObject", "s3:DeleteBucket"
+        ],
+        "owner": "devops-team",
+        "environment": "staging",
+        "status": "active",
+        "risk_preset": "high_destruction",
+    },
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NORMAL EVENT TEMPLATES  (realistic, business-hours activity)
+# ─────────────────────────────────────────────────────────────────────────────
+
+NORMAL_EVENTS = {
+    "agent-001": [
+        ("GetItem",       "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/CustomerProfiles",     "CustomerProfiles"),
+        ("Query",         "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/PurchaseHistory",      "PurchaseHistory"),
+        ("GetObject",     "s3",       "arn:aws:s3:::product-catalog/categories/electronics.json",            "product-catalog/electronics.json"),
+        ("InvokeModel",   "bedrock",  "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku", "claude-3-haiku"),
+        ("SendMessage",   "sqs",      "arn:aws:sqs:us-east-1:123456789012:product-suggestions",              "product-suggestions"),
+        ("Query",         "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/BrowsingHistory",       "BrowsingHistory"),
+        ("InvokeModel",   "bedrock",  "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku", "claude-3-haiku"),
+        ("GetItem",       "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/ProductReviews",        "ProductReviews"),
+    ],
+    "agent-002": [
+        ("GetItem",       "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/TransactionHistory",   "TransactionHistory"),
+        ("Query",         "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/TransactionHistory",   "TransactionHistory"),
+        ("InvokeModel",   "bedrock",  "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet", "claude-3-sonnet"),
+        ("UpdateItem",    "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/TransactionRisk",      "TransactionRisk"),
+        ("PutItem",       "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/FraudAlerts",          "FraudAlerts"),
+        ("Publish",       "sns",      "arn:aws:sns:us-east-1:123456789012:fraud-alerts",                     "fraud-alerts"),
+        ("InvokeFunction","lambda",   "arn:aws:lambda:us-east-1:123456789012:function:RiskScoreCalculator", "RiskScoreCalculator"),
+        ("GetItem",       "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/CustomerRiskProfile",  "CustomerRiskProfile"),
+    ],
+    "agent-003": [
+        ("GetObject",       "s3",       "arn:aws:s3:::hr-documents/resumes/candidate-12345.pdf",              "hr-documents/resumes/candidate-12345.pdf"),
+        ("AnalyzeDocument", "textract", "arn:aws:s3:::hr-documents/resumes/candidate-12345.pdf",              "candidate-12345.pdf"),
+        ("InvokeModel",     "bedrock",  "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet", "claude-3-sonnet"),
+        ("PutItem",         "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/EmployeeRecords",      "EmployeeRecords"),
+        ("GetObject",       "s3",       "arn:aws:s3:::hr-documents/contracts/offer-letter-98765.pdf",         "hr-documents/contracts/offer-letter-98765.pdf"),
+        ("UpdateItem",      "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/EmployeeRecords",      "EmployeeRecords"),
+        ("GetItem",         "dynamodb", "arn:aws:dynamodb:us-east-1:123456789012:table/EmployeeRecords",      "EmployeeRecords"),
+    ],
+    "agent-004": [
+        ("GetObject",       "s3",       "arn:aws:s3:::raw-data-lake/events/2026-10-21/batch-001.parquet",   "raw-data-lake/events/batch-001.parquet"),
+        ("ListBucket",      "s3",       "arn:aws:s3:::raw-data-lake/events/2026-10-21/",                    "raw-data-lake/events/2026-10-21/"),
+        ("StartJobRun",     "glue",     "arn:aws:glue:us-east-1:123456789012:job/NightlyETLPipeline",       "NightlyETLPipeline"),
+        ("GetJobRun",       "glue",     "arn:aws:glue:us-east-1:123456789012:job/NightlyETLPipeline",       "NightlyETLPipeline"),
+        ("PutObject",       "s3",       "arn:aws:s3:::processed-data/clean/2026-10-21/output.parquet",      "processed-data/clean/output.parquet"),
+        ("StartQueryExecution", "athena", "arn:aws:athena:us-east-1:123456789012:workgroup/primary",        "primary"),
+        ("GetObject",       "s3",       "arn:aws:s3:::raw-data-lake/events/2026-10-21/batch-002.parquet",   "raw-data-lake/events/batch-002.parquet"),
+    ],
+    "agent-005": [
+        ("UpdateFunctionConfiguration", "lambda",        "arn:aws:lambda:us-east-1:123456789012:function:staging-api-handler",     "staging-api-handler"),
+        ("GetFunction",                 "lambda",        "arn:aws:lambda:us-east-1:123456789012:function:staging-api-handler",     "staging-api-handler"),
+        ("DescribeInstances",           "ec2",           "arn:aws:ec2:us-east-1:123456789012:instance/i-0staging123",              "i-0staging123"),
+        ("StartInstances",              "ec2",           "arn:aws:ec2:us-east-1:123456789012:instance/i-0staging123",              "i-0staging123"),
+        ("GetMetricData",               "cloudwatch",    "arn:aws:cloudwatch:us-east-1:123456789012:metric/AWS/Lambda/Invocations","Lambda/Invocations"),
+        ("UpdateStack",                 "cloudformation","arn:aws:cloudformation:us-east-1:123456789012:stack/staging-app-stack",  "staging-app-stack"),
+        ("GetObject",                   "s3",            "arn:aws:s3:::deployment-configs/staging/app-config.yaml",                "deployment-configs/staging/app-config.yaml"),
+    ],
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ANOMALOUS EVENT TEMPLATES (showcasing detection capabilities)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ANOMALOUS_EVENTS = {
+    "agent-003": [
+        ("CreateRole",        "iam",            "arn:aws:iam::123456789012:role/PrivilegeEscalationRole",                  "PrivilegeEscalationRole",   "⚠️ PRIVILEGE ESCALATION: HR agent created IAM role with elevated permissions outside its scope"),
+        ("AttachRolePolicy",  "iam",            "arn:aws:iam::aws:policy/AdministratorAccess",                             "AdministratorAccess",       "🚨 CRITICAL: Attached AdministratorAccess policy granting unrestricted AWS account control"),
+        ("ListRoles",         "iam",            "arn:aws:iam::123456789012:role/*",                                        "*",                         "🔍 RECONNAISSANCE: Enumerated all IAM roles in account — potential attack preparation"),
+        ("GetSecretValue",    "secretsmanager", "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/stripe-api-key", "prod/stripe-api-key",     "💳 CREDENTIAL THEFT: Accessed production payment gateway API keys without authorization"),
+        ("ExecuteStatement",  "rds",            "arn:aws:rds:us-east-1:123456789012:cluster:production-payments-db",       "production-payments-db",    "🗄️ DATA BREACH: Direct SQL execution on production payment database using stolen credentials"),
+    ],
+    "agent-004": [
+        ("GetSecretValue",    "secretsmanager", "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/rds-master-password", "prod/rds-master-password", "🔑 SECRET EXFILTRATION: Data pipeline accessed production RDS master credentials"),
+        ("GetSecretValue",    "secretsmanager", "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/api-gateway-key",     "prod/api-gateway-key",     "🔓 UNAUTHORIZED ACCESS: Retrieved production API gateway keys outside ETL scope"),
+        ("Scan",              "dynamodb",       "arn:aws:dynamodb:us-east-1:123456789012:table/CustomerPII",                      "CustomerPII",              "👥 PII EXPOSURE: Full table scan of customer personal data — potential mass data exfiltration"),
+        ("DeleteObject",      "s3",             "arn:aws:s3:::raw-data-lake/events/2026-10-critical-backup/",                     "critical-backup/",         "💣 DESTRUCTIVE ACTION: Mass deletion of protected data lake backups — data integrity threat"),
+    ],
+    "agent-005": [
+        ("TerminateInstances", "ec2",           "arn:aws:ec2:us-east-1:123456789012:instance/i-0production789",                   "i-0production789",         "🛑 SERVICE DISRUPTION: Terminated production EC2 instance — DevOps agent breached environment boundary"),
+        ("DeleteItem",         "dynamodb",      "arn:aws:dynamodb:us-east-1:123456789012:table/ProductionOrders",                 "ProductionOrders",         "🗑️ DATA DELETION: Removed records from production orders table without authorization"),
+        ("DeleteBucket",       "s3",            "arn:aws:s3:::customer-uploads-production",                                       "customer-uploads-production", "☠️ CRITICAL DESTRUCTION: Attempted to delete production S3 bucket containing customer data"),
+        ("Scan",               "dynamodb",      "arn:aws:dynamodb:us-east-1:123456789012:table/PaymentTransactions",              "PaymentTransactions",      "💰 FINANCIAL DATA ACCESS: Scanned entire payment transactions table — unauthorized data access"),
+    ],
+}
+
+# Rest of the seed_data.py file remains the same...
+# (Continue with existing code for RISK_SCENARIOS, create_demo_agents, create_activity_logs, etc.)

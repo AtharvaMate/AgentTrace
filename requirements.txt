@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+python-dotenv
+google-generativeai
+pydantic
+pydantic-settings
+httpx
+alembic
+python-multipart
+boto3
+tensorflow>=2.13.0
+numpy
+scikit-learn
+pandas
